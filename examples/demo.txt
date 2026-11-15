@@ -1,0 +1,26 @@
+help
+student add Анна Иванова
+student add Борис Петров
+student list
+criterion add Домашняя работа | 10 | 40
+criterion add Экзамен | 20 | 60
+criterion list
+grade set 1 1 8
+grade set 1 2 15
+grade set 2 1 10
+grade list 1
+total 1 strict
+grade set 1 99 8
+grade correct 1 1 12
+total 1 strict
+grade correct 1 1 10
+total 1 strict
+grade cancel 1 2
+total 1 strict
+total 1 zero
+grade set 1 2 15
+report strict
+report zero
+export strict exports/strict.csv
+export zero exports/zero.csv
+exit

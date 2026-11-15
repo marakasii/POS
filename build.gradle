@@ -1,0 +1,187 @@
+plugins {
+    id 'application'
+    id 'checkstyle'
+    id 'jacoco'
+}
+
+group = 'studying'
+version = '1.0.0'
+
+repositories {
+    mavenCentral()
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+application {
+    mainClass = 'studying.Main'
+    applicationDefaultJvmArgs = [
+        '-Dfile.encoding=UTF-8',
+        '-Dguice_bytecode_gen_option=DISABLED'
+    ]
+}
+
+dependencies {
+    implementation 'com.google.inject:guice:7.0.0'
+    constraints {
+        // Guice's older transitive Guava emits Unsafe warnings on JDK 25.
+        implementation 'com.google.guava:guava:33.5.0-jre'
+    }
+    testImplementation platform('org.junit:junit-bom:6.0.3')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+def checkstyleVersion = '14.1.0'
+def sunChecks = configurations.detachedConfiguration(
+    dependencies.create("com.puppycrawl.tools:checkstyle:$checkstyleVersion")
+)
+sunChecks.transitive = false
+def generatedConfig = layout.buildDirectory.file('checkstyle/sun_checks.xml')
+
+checkstyle {
+    toolVersion = checkstyleVersion
+    config = resources.text.fromFile(generatedConfig)
+    showViolations = true
+    ignoreFailures = false
+    maxWarnings = 0
+    maxErrors = 0
+}
+
+def prepareCheckstyleConfig = tasks.register('prepareCheckstyleConfig') {
+    inputs.files(sunChecks)
+    outputs.file(generatedConfig)
+    doLast {
+        def xml = resources.text.fromArchiveEntry(sunChecks, 'sun_checks.xml')
+            .asString()
+        ['JavadocPackage', 'JavadocVariable'].each { name ->
+            def module = "<module name=\"$name\"/>"
+            if (!xml.contains(module)) {
+                throw new GradleException("Missing $name in Sun configuration")
+            }
+            xml = xml.replace(module, '')
+        }
+        def target = generatedConfig.get().asFile
+        target.parentFile.mkdirs()
+        target.setText(xml, 'UTF-8')
+    }
+}
+
+tasks.withType(Checkstyle).configureEach {
+    dependsOn prepareCheckstyleConfig
+    reports {
+        html.required = true
+        xml.required = false
+    }
+}
+
+tasks.named('run', JavaExec) {
+    dependsOn tasks.withType(Checkstyle)
+    standardInput = System.in
+    systemProperty 'file.encoding', 'UTF-8'
+}
+
+jacoco {
+    toolVersion = '0.8.14'
+}
+
+tasks.named('test', Test) {
+    useJUnitPlatform {
+        excludeTags 'integration'
+    }
+    finalizedBy tasks.named('jacocoTestReport')
+}
+
+// Reflection is sufficient: this application does not use Guice interceptors.
+tasks.withType(Test).configureEach {
+    systemProperty 'guice_bytecode_gen_option', 'DISABLED'
+}
+
+tasks.register('integrationTest', Test) {
+    description = 'Runs tagged integration checks separately from unit coverage.'
+    group = 'verification'
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform {
+        includeTags 'integration'
+    }
+    jacoco.enabled = false
+    shouldRunAfter tasks.named('test')
+}
+
+def unitExec = layout.buildDirectory.file('jacoco/test.exec')
+def requireUnitCoverageData = tasks.register('requireUnitCoverageData') {
+    dependsOn tasks.named('test')
+    doLast {
+        if (tasks.named('test').get().state.noSource
+                || !unitExec.get().asFile.isFile()) {
+            throw new GradleException('Unit coverage execution data is missing')
+        }
+        def results = fileTree(layout.buildDirectory.dir('test-results/test')) {
+            include 'TEST-*.xml'
+        }
+        def executed = results.collect { result ->
+            def suite = new groovy.xml.XmlSlurper().parse(result)
+            suite.@tests.toInteger() - suite.@skipped.toInteger()
+        }.sum() ?: 0
+        if (executed == 0) {
+            throw new GradleException('No unit tests were executed')
+        }
+    }
+}
+
+tasks.named('jacocoTestReport', JacocoReport) {
+    dependsOn tasks.named('test'), requireUnitCoverageData
+    executionData.setFrom(unitExec)
+    reports {
+        html.required = true
+        xml.required = true
+        csv.required = false
+    }
+}
+
+// The user-selected threshold defaults to 80 in gradle.properties.
+def minimumLineCoverage = providers.gradleProperty('minimumLineCoverage')
+tasks.named('jacocoTestCoverageVerification', JacocoCoverageVerification) {
+    dependsOn tasks.named('jacocoTestReport')
+    executionData.setFrom(unitExec)
+    doFirst {
+        def report = layout.buildDirectory
+            .file('reports/jacoco/test/jacocoTestReport.xml').get().asFile
+        def counters = (report.getText('UTF-8') =~
+            /<counter type="LINE" missed="(\d+)" covered="(\d+)"\/>/
+        ).findAll()
+        if (counters.isEmpty() || counters.last()[1].toInteger()
+                + counters.last()[2].toInteger() == 0) {
+            throw new GradleException('No production lines in unit report')
+        }
+    }
+    if (minimumLineCoverage.isPresent()) {
+        def percentage = minimumLineCoverage.get().toBigDecimal()
+        if (percentage < 0 || percentage > 100) {
+            throw new GradleException('Coverage percentage must be in [0, 100]')
+        }
+        violationRules {
+            rule {
+                limit {
+                    counter = 'LINE'
+                    value = 'COVEREDRATIO'
+                    minimum = percentage / 100
+                }
+            }
+        }
+    }
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('integrationTest')
+    dependsOn tasks.named('jacocoTestCoverageVerification')
+}
